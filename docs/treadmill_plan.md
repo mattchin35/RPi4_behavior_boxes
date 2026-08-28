@@ -34,7 +34,7 @@ The new system must not be declared ready for experiments until the synthetic, m
 Before planning further or implementing anything, the coordinating agent must:
 
 1. read the repository `AGENTS.md` in full;
-2. read `docs/treadmill_spec.md` and this entire plan, including the live ledger in Section 19;
+2. read `docs/SoftwareDesign.md`, `docs/treadmill_spec.md`, and this entire plan, including the live ledger in Section 19;
 3. inspect `git status` and preserve all unrelated/user changes;
 4. inspect the files listed for the next work package and search their callers before editing;
 5. confirm that the preceding work-package exit gate and required commits/evidence exist;
@@ -121,7 +121,7 @@ Responsibilities stay separate:
 
 ## 5. Module and file layout
 
-Create a new internal package rather than putting all responsibilities in one file:
+Create a small internal package rather than putting all responsibilities in one file. The first draft proposed separate catch-all `models.py` and `gpio_resolution.py` modules. After applying `docs/SoftwareDesign.md`, this plan instead keeps data beside the functions that interpret it, avoids a generic “models” dumping ground, and keeps GPIO resolution with the only production component that uses it.
 
 ```text
 essential/
@@ -129,13 +129,12 @@ essential/
     Treadmill.py                        # session integration facade
     treadmill_acquisition/
         __init__.py
-        config.py                       # validated TreadmillConfig and enums
-        models.py                       # EdgeEvent, state, summary, typed errors
-        quadrature.py                   # pure state machine and calculations
+        config.py                       # validated immutable configuration
+        quadrature.py                   # edge/decoder data plus deterministic functions
+        state.py                        # public state, health, shared-layout conversions
         shared_state.py                 # nonblocking coherent publication
-        gpio_backend.py                 # backend protocol and libgpiod v2 adapter
-        gpio_resolution.py              # Pi/chip/BCM resolution and capability probe
-        acquisition_process.py          # worker loop, handshake, controls, heartbeat
+        gpio_backend.py                 # EdgeSource Protocol, resolver, libgpiod adapter
+        acquisition.py                  # worker loop, handshake, controls, heartbeat
         continuous_logger.py            # monotonic 200 Hz sampler and incremental files
         diagnostics.py                  # counters, histogram, ring buffer, summaries
 
@@ -153,13 +152,43 @@ docs/
 
 Do not use the existing `essential/treadmill/` Arduino-sketch directory as the Python package; mixing firmware snapshots and runtime Python would be confusing. Do not modify the `.ino` files.
 
-Every function/method and public dataclass will document input types, shapes where applicable, axis/order conventions, units, return values, exceptions, and lifecycle constraints.
+Do not create all files up front. Each module is added only when its work package begins and its tests demonstrate a current need. If implementation shows that two proposed modules are too small or inseparable, the coordinator must record and approve the simplification before changing the layout.
+
+### 5.1 Module contracts and limitations
+
+| Module | Purpose and inputs | Outputs/public boundary | Limitations/non-goals |
+|---|---|---|---|
+| `config.py` | Convert the treadmill portion of session configuration into an immutable, validated `TreadmillConfig`; accepts plain Python values | Config dataclass and closely related configuration enums/validation functions | Does not inspect GPIO devices, create processes, or write files |
+| `quadrature.py` | Apply ordered `EdgeEvent` values and zero commands to an explicitly passed mutable `DecoderState` using calibration/sign scalars | `EdgeEvent`, private/internal decoder-state dataclass, deterministic module-level transition/speed/zero functions | No GPIO imports, clocks, IPC, logging, or public session logic; mutation is limited to the state argument and documented for hot-path efficiency |
+| `state.py` | Define behavior-facing state/health and convert between explicit-width shared fields and immutable snapshots | `TreadmillState`, health/direction enums, fixed shared schema conversion functions | Does not own shared memory/locks or calculate quadrature transitions |
+| `shared_state.py` | Publish/read coherent `state.py` fields through two nonblocking process-safe slots | Narrow publisher and reader objects used by acquisition, facade, and logger | No decoder, GPIO, health-policy, or file behavior |
+| `gpio_backend.py` | Resolve BCM pins, validate/request libgpiod lines, synchronize initial state, and adapt batches to `EdgeEvent` | Narrow `EdgeSource` Protocol, production `GpiodEdgeSource`, pure resolver helpers | Only module importing `gpiod`; no decoding, multiprocessing ownership, or disk writes |
+| `acquisition.py` | Run the worker around injected edge source, decoder state/functions, publisher, and bounded control/status endpoints | Top-level spawn-safe worker entry function and structured command/status dataclasses local to this boundary | Does not construct the behavior facade or logger and never performs disk I/O |
+| `continuous_logger.py` | Schedule fixed-rate snapshot reads and incrementally write the defined recording artifacts | Top-level spawn-safe logger entry function plus focused scheduler/writer helpers | No edge stream, quadrature decoding, or behavior callbacks |
+| `diagnostics.py` | Maintain bounded diagnostic aggregates/ring records and serialize diagnostic/summary structures | Focused dataclasses/functions consumed by decoder, worker, and logger | No process orchestration; does not become a general application logging framework |
+| `essential/treadmill_decoder.py` | Composition/public API boundary: validate supplied config, assemble concrete defaults, own lifecycle, and expose simple behavior-facing operations | `TreadmillDecoder`, public state/config/errors re-exported intentionally | The only place allowed to know the complete runtime composition; no quadrature or libgpiod implementation details |
+| `essential/Treadmill.py` | Translate existing session configuration/output basename to the public decoder facade | Backward-compatible session equipment interface where approved | No edge callbacks, event list, GPIO details, or duplicate health logic |
+
+### 5.2 Design rules from `SoftwareDesign.md`
+
+- Prefer module-level, deterministic functions for quadrature transitions, calibration, zeroing, deadline calculation, and serialization. Use classes only for cohesive stateful resources such as an acquired GPIO request, shared-state slots, or the public lifecycle facade.
+- Use dataclasses for configuration and data records. Do not combine public data representation with unrelated orchestration behavior.
+- Use composition, not inheritance. No mixins or class hierarchy are planned.
+- Define a `Protocol` only where more than one real/test implementation is required. Initially this applies to the edge source; a narrower additional Protocol may be added only when a consumer demonstrably needs substitution. Do not create a broad `interfaces.py` module or one Protocol per class.
+- Keep each Protocol beside its consumer or cohesive domain module. Production adapters and synthetic fakes must satisfy the same narrow contract without subclassing.
+- Separate creation from use at the system boundary: `essential/treadmill_decoder.py` is the composition root that selects concrete production dependencies. Lower-level worker/logger functions receive only the dependencies/endpoints they use. Tests construct lower-level pieces directly with explicit fakes.
+- Pass narrow values or dataclasses rather than the full `session_info` dictionary below `essential/Treadmill.py`. Helpers should not reach through facade internals or depend on concrete implementations.
+- Avoid global mutable state, lambdas, convenience nested functions, currying, and control flags that make lower-level functions perform unrelated behaviors. Stable schema/version constants are allowed and documented.
+- Type all function/method inputs and outputs and non-obvious class attributes. Avoid noisy annotations for obvious locals.
+- Comments explain rationale, empirical constants, concurrency invariants, or non-obvious edge cases; names and small functions should explain routine mechanics.
+- Every function/method and public dataclass documents input types, shapes where applicable, axis/order conventions, units, returns, exceptions, mutation/side effects, and lifecycle constraints.
+- Optimize only the measured hot path. The explicit in-place decoder-state update is permitted to avoid per-edge allocations, but must remain deterministic from its provided state/event/config inputs and independently testable.
 
 ## 6. Core data contracts
 
 ### 6.1 Configuration
 
-`TreadmillConfig` will be an immutable dataclass constructed from `session_info['treadmill_setup']`. Fields and initial defaults:
+`TreadmillConfig` will be an immutable dataclass constructed from a plain mapping containing only the extracted treadmill settings. `essential/Treadmill.py` owns extraction from `session_info`; no internal acquisition module receives the full session dictionary. Fields and initial defaults:
 
 | Field | Type/unit | Initial default or rule |
 |---|---|---|
@@ -285,6 +314,28 @@ At startup, import the official libgpiod v2 Python binding and verify actual sup
 
 If any capability is absent, raise an actionable startup exception. There is no `RPi.GPIO` fallback.
 
+The narrow `EdgeSource` Protocol is the only planned behavioral abstraction around GPIO. Its conceptual contract is:
+
+```text
+open() -> None
+    Resolve and claim resources; safe to close after partial failure.
+
+synchronize(deadline_monotonic_ns: int) -> SynchronizedInputState
+    Return coherent raw A/B levels, accepted sequence baselines, and mapping metadata;
+    fail if a clean state is not established before the deadline.
+
+wait_for_events(timeout_s: float) -> bool
+    Wait at most timeout_s monotonic seconds; return whether events are pending.
+
+read_events(max_events: int) -> list[EdgeEvent]
+    Return 0..max_events events in backend/kernel order without decoding them.
+
+close() -> None
+    Idempotently release only owned resources.
+```
+
+`SynchronizedInputState` is a focused dataclass in `gpio_backend.py`, because it describes an edge-source operation rather than public treadmill state. The acquisition worker receives a top-level, spawn-pickleable edge-source creator and constructs the concrete source inside the child process; it never receives an already-open libgpiod object from the parent. Tests inject a top-level fake creator without subclassing.
+
 ### 8.2 BCM-to-chip resolution
 
 Enumerate `/dev/gpiochip*` through libgpiod, inspect chip name/label/line count and line information, read Pi model/OS/kernel information, and select only a chip demonstrably representing the user-facing header controller. Expected labels such as `pinctrl-bcm2711` and `pinctrl-rp1` are evidence, not a blind exclusive list.
@@ -319,7 +370,7 @@ The loop order will be:
 6. poll a bounded number of control/logger-status messages only after available edges are drained;
 7. repeat immediately if more edges are pending.
 
-Processing lag is `time.monotonic_ns() - event.timestamp_ns`. Maintain count, sum, maximum, latest, and a fixed-bin histogram in the hot path; derive percentiles from the histogram at summary time. The raw diagnostic ring is a bounded `deque(maxlen=...)` of compact records.
+Processing lag is `processing_monotonic_ns - event.timestamp_ns`. The worker's production composition supplies `time.monotonic_ns`; lower-level functions receive the sampled integer explicitly, and tests supply deterministic values rather than patching module globals. Maintain count, sum, maximum, latest, and a fixed-bin histogram in the hot path; derive percentiles from the histogram at summary time. The raw diagnostic ring is a bounded `deque(maxlen=...)` of compact records.
 
 ## 9. Nonblocking coherent shared state
 
@@ -407,7 +458,7 @@ health_code, integrity_valid, state_version
 
 Write a header immediately, buffer a bounded number of rows, flush chunks incrementally, and periodically flush the Python buffer. Decide whether periodic `fsync` is worth its I/O cost from measurements; always flush and `fsync` during normal finalization. Never hold the full session in RAM.
 
-The logger uses `next_deadline_ns += period_ns`. When late, it records the actual sample time, increments late/missed counts based on crossed deadlines, advances directly to the next future deadline, and emits one real sample—never duplicate catch-up rows.
+The logger uses `next_deadline_ns += period_ns`. Deadline advancement/missed-period calculation is a deterministic module-level function receiving `now_ns`, `next_deadline_ns`, and `period_ns`. The process boundary supplies the production clock/wait operations; unit tests pass deterministic clock values without hidden global state. When late, the logger records the actual sample time, increments late/missed counts based on crossed deadlines, advances directly to the next future deadline, and emits one real sample—never duplicate catch-up rows.
 
 The logger runs as a separate process and will request a modest lower scheduling priority using ordinary unprivileged OS facilities where supported. Whether that request succeeded is metadata, not a hidden assumption; priority setup failure must not prevent baseline operation.
 
@@ -503,7 +554,7 @@ coordinator review, regression verification, implementation commit, plan-ledger 
 
 The same Terra Medium subagent may receive assignment B after assignment A is reviewed, but test and implementation work remain separate assignments and commits.
 
-### 14.1 Tests written first for Phase 1: config, models, pure decoder
+### 14.1 Tests written first for Phase 1: config, state, pure decoder
 
 1. Config accepts all valid boundary/default values and rejects same pins, invalid signs, nonpositive calibration/timeouts/rates/buffers, bad heartbeat relationships, and invalid policies.
 2. Positive and negative one-cycle sequences yield exactly `+4` and `-4` transitions.
@@ -585,7 +636,7 @@ Exit gate: decisions are documented and the implementation plan is approved. No 
 ### Phase 1 — pure decoder
 
 - Commit the Section 14.1 tests and confirm RED.
-- Implement config/models/quadrature/diagnostics with full data-contract docstrings.
+- Implement `config.py`, `state.py`, `quadrature.py`, and `diagnostics.py` incrementally with full data-contract docstrings; do not create a module until its tests require it.
 - Run GREEN, refactor for clarity, then run the full non-hardware test suite.
 
 Exit gate: exhaustive, randomized, speed, zero, failure-injection, and bounded-memory unit tests pass without GPIO or multiprocessing.
@@ -651,15 +702,15 @@ These are the default units of delegation. The coordinating agent may split a pa
 |---|---|---|---|
 | `TM-0A` Decisions and environment inventory | Plan approval | Read-only inspection plus Section 18 answers; target Pi/OS/Python/libgpiod, encoder electronics, pins, session length, deployment source | Updated Sections 3, 13, 18, and 19; no implementation |
 | `TM-0B` GPIO ownership inventory | `TM-0A` | Locate all GPIO allocations; plan centralized validation in `session_info.py`/new config without editing runtime code in the planning assignment | Approved pin map and conflict rules recorded in plan |
-| `TM-1A` Config/models RED | `TM-0A`, `TM-0B` | Tests only for `config.py` and `models.py`; validation, enums, units, immutable contracts | Tests-only commit; focused `uv run pytest` output showing expected missing-implementation failures |
-| `TM-1B` Config/models GREEN | `TM-1A` | Implement only config/models and public data contracts | Focused GREEN plus affected regression tests; implementation commit |
-| `TM-1C` Nominal quadrature RED/GREEN | `TM-1B` | Tests first, then `quadrature.py` nominal x4 sequences, calibration/sign, position/distance, speed, zero offsets | Separate RED and GREEN commits; exhaustive starting-state evidence |
+| `TM-1A` Config/public-state RED | `TM-0A`, `TM-0B` | Tests only for `config.py` and `state.py`; validation, enums, units, immutable public contracts and explicit-width conversion rules | Tests-only commit; focused `uv run pytest` output showing expected missing-implementation failures |
+| `TM-1B` Config/public-state GREEN | `TM-1A` | Implement only `config.py`, `state.py`, and their data contracts | Focused GREEN plus affected regression tests; implementation commit |
+| `TM-1C` Nominal quadrature RED/GREEN | `TM-1B` | Tests first, then `quadrature.py` edge/internal-state dataclasses and nominal x4 functions for calibration/sign, position/distance, speed, and zero offsets | Separate RED and GREEN commits; exhaustive starting-state evidence |
 | `TM-1D` Integrity/diagnostics RED/GREEN | `TM-1C` | Failure-matrix tests, then sequence/state/timestamp checks, latching, lag aggregates, bounded ring | Separate commits; randomized/failure/bounded-memory evidence |
 | `TM-2A` GPIO capability adapter | `TM-1D`, verified binding | Fake API tests first, then `gpio_backend.py` capability probe/event adaptation/line request | Binding-source reference recorded; RED/GREEN commits; no hardware-only assumptions |
-| `TM-2B` GPIO resolver | `TM-2A` | Synthetic inventories and errors first, then `gpio_resolution.py` Pi 4/Pi 5 dynamic resolution | Ambiguity/missing/claimed-line tests and actionable-error snapshots |
+| `TM-2B` GPIO resolver | `TM-2A` | Synthetic inventories and errors first, then cohesive resolver helpers within `gpio_backend.py` for Pi 4/Pi 5 dynamic resolution | Ambiguity/missing/claimed-line tests and actionable-error snapshots |
 | `TM-2C` Startup synchronization and batch loop | `TM-2A`, `TM-2B` | Boundary-injection tests first, then race-safe synchronization and batch-drain primitive | Proof each boundary event is decoded once or explicitly excluded before READY |
 | `TM-3A` Shared publication | `TM-1D` | Coherence/stalled-reader tests first, then `shared_state.py` double-slot publication | Stress evidence: no torn states and writer progress with stalled readers |
-| `TM-3B` Acquisition lifecycle | `TM-2C`, `TM-3A` | Process/startup/heartbeat/death/shutdown tests first, then `acquisition_process.py` | Bounded lifecycle timings, staged errors, child cleanup evidence |
+| `TM-3B` Acquisition lifecycle | `TM-2C`, `TM-3A` | Process/startup/heartbeat/death/shutdown tests first, then `acquisition.py` | Bounded lifecycle timings, staged errors, child cleanup evidence |
 | `TM-3C` Controls, health, facade | `TM-3B` | Zero/queue/policy tests first, then `essential/treadmill_decoder.py` facade and typed outcomes | Ack/version evidence; effective-health and compatibility review |
 | `TM-4A` Logger schemas and incremental writer | `TM-3A`, decisions in `TM-0A` | File-contract/partial-file tests first, then CSV/JSON/JSONL writer primitives | Stable schema fixtures, bounded-buffer and abnormal-file evidence |
 | `TM-4B` Logger process and scheduler | `TM-3B`, `TM-4A` | Deadline/lateness/failure tests first, then `continuous_logger.py` process | 200 Hz simulated timing evidence; no catch-up duplicates/backpressure |
@@ -797,6 +848,7 @@ Current planning handoff:
 
 - Status: planning in progress; implementation not started.
 - Current artifact: `docs/treadmill_plan.md`.
+- Latest design review: `docs/SoftwareDesign.md` was read on 2026-08-28. The proposed catch-all `models.py` and separate `gpio_resolution.py` were removed from the layout; data now stays with cohesive functions, the functional-core/composition/Protocol rules are explicit, and lower layers receive narrow dependencies rather than `session_info`.
 - Known blocking facts: BCM17/27 conflict with existing behavior-box allocations; hardware/electrical/calibration/platform details and pause semantics are unresolved.
 - Repository caution: the worktree contained unrelated user changes before/during planning; future agents must inspect and preserve them.
 - Exact next action: user reviews this plan and answers Section 18. The plan is revised/approved in a planning-only chat before any `TM-1*` test or implementation assignment.
