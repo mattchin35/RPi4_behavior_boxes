@@ -12,12 +12,12 @@ Current plan state as of 2026-08-28:
 
 | Item | State |
 |---|---|
-| Planning | In progress; expanded plan awaiting user review and answers to Section 18 |
+| Planning | In progress; decisions 4–8 resolved, awaiting hardware/platform answers 1–3 and user approval |
 | Implementation | **Not started** |
 | Tests written/run for this rewrite | None |
 | Implementation commits | None |
 | Active implementation phase | None; Phase 0 is blocked on decisions/approval |
-| Next action | Review this plan, answer Section 18, and explicitly approve it before a later implementation chat |
+| Next action | Supply the remaining Section 18 hardware/platform facts, review the updated decisions, and explicitly approve the plan before a later implementation chat |
 
 The implementation will use `debug/treadmill_decoder.py` as the calibration and behavior-facing reference, but it will replace that script's architecture. Production integration currently occurs through:
 
@@ -73,16 +73,17 @@ The kernel event buffer and the userspace read batch are independent. The reques
 
 ## 3. Decisions and approval gates
 
-The following decisions are recommended so the plan is implementable. They must be confirmed before Phase 1 implementation begins.
+The following decisions define the current plan. Decisions 2, 3, 4, 6, and 8 incorporate the user's resolved answers in Section 18.2. The remaining items and the plan as a whole still require approval after Section 18.1 is answered.
 
 1. **Production scope:** rewrite the production path under `essential/`, not only the debug script. Keep `debug/treadmill_decoder.py` unchanged as a historical/calibration reference until migration is complete.
-2. **Public compatibility boundary:** keep imports of `essential.treadmill_decoder.TreadmillDecoder` and the `essential.Treadmill.Treadmill` class working where practical. Preserve `start()`, `snapshot()`, `zero()`, `stop()`, and `close()`. Replace ambiguous raw-count fields in new code with explicit transition and physical-unit fields; provide documented read-only legacy aliases only if a current caller requires them.
-3. **Logging format:** use incrementally written CSV for the 200 Hz normal record plus JSON/JSONL sidecars for metadata, diagnostic events, and the final summary. This adds no dependency, remains readable after abnormal termination, and preserves compatibility with current lab workflows. Measure MB/hour during validation; change to a fixed-record binary format only if measured storage or CPU cost is unacceptable.
-4. **Logger criticality:** default `continuous_logger_required = False`. Logger failure makes health `DEGRADED` and is loud, but does not invalidate encoder position. If configured `True`, logger failure makes health `FAILED`; it still does not set `integrity_valid = False` unless edge integrity was also lost.
+2. **Public compatibility boundary:** keep imports of `essential.treadmill_decoder.TreadmillDecoder` and the `essential.Treadmill.Treadmill` class working where practical. Preserve `start()`, `snapshot()`, `zero()`, `stop()`, and `close()`. No current/planned task consumes legacy `counts`, `distance_mm`, `speed_mms`, or `direction`, so do not add speculative compatibility aliases. New task code uses explicit physical `position_mm`, `distance_travelled_mm`, and `speed_mm_s` fields. Adding a legacy alias later is a requirement change with documented x1/x4 semantics.
+3. **Logging format:** CSV interoperability is not required. Use one incrementally written SQLite database for normal samples, metadata, timebase anchors, diagnostic events, optional raw events, and the final summary. SQLite is in the Python standard library, self-describing, transactional, and recoverable to the last committed batch after abnormal termination. Keep a minimal fallback error record in the existing application log if the database/logger itself fails. Measure CPU, disk latency, transaction loss window, and MB/hour before accepting the format.
+4. **Logger criticality:** `continuous_logger_required = False`. Logger failures make health `DEGRADED`, publish a structured status, and are warned/logged loudly; they do not invalidate encoder position. The facade reports the failure through the existing application logger even if the treadmill database cannot record it. If a future configuration explicitly sets the logger as required, logger failure makes health `FAILED`, but still does not set `integrity_valid = False` unless edge integrity was also lost.
 5. **Calibration migration:** seed configuration with the explicitly unverified migration hypothesis `mm_per_encoder_cycle = 0.41095`, giving `mm_per_transition = 0.1027375`. Mark metadata as unverified and block production acceptance until physical calibration confirms or replaces it.
-6. **Failure policy:** implement `warn`, `pause`, and `abort` as typed outcomes from the treadmill facade. The exact operator interaction for resuming a paused session is not defined by the spec and must be chosen before behavior-loop integration. No implementation may relabel `abort` as `pause`.
+6. **Failure policy and task boundary:** `WARN` is the default and is valid for both passive logging and tasks that actively use treadmill data. End users own the acceptable tolerance for degraded or imperfect data and may select `WARN`, `PAUSE`, or `ABORT` independently of whether treadmill data is task-required. `WARN` keeps acquisition/logger failures visible through degraded/failed health and structured logs while allowing task progression. `PAUSE` only exposes a latched `pause_requested`/typed policy outcome intended to freeze task progression. The treadmill subsystem does not freeze, resume, or otherwise wire a task; task code must inspect and handle that outcome. `ABORT` similarly exposes a distinct typed abort outcome for the application boundary. `PAUSE` and `ABORT` are never mandatory, and no implementation may relabel one outcome as another.
 7. **Platform baseline:** select and record the supported Raspberry Pi OS, Python, kernel, and libgpiod/Python-binding versions before locking dependencies. The implementation will target the official libgpiod v2 API and fail its capability probe if required features are missing.
-8. **Pin assignment:** select two BCM header pins not used elsewhere in `BehavBox` or the attached hardware. The pin map must be reviewed against the actual breakout board before Pi tests.
+8. **Dependency management:** adopt `pyproject.toml` and `uv.lock` as the authoritative Python environment. Inventory and migrate existing requirements deliberately, separating Pi-only hardware dependencies where needed; do not merely copy an unverified requirements list. `requirements_simple.txt` may remain temporarily as a clearly deprecated migration reference but is no longer the source of truth after the lockfile migration is accepted.
+9. **Pin assignment:** select two BCM header pins not used elsewhere in `BehavBox` or the attached hardware. The pin map must be reviewed against the actual breakout board before Pi tests.
 
 ## 4. Proposed architecture
 
@@ -116,7 +117,7 @@ Responsibilities stay separate:
 - The acquisition worker owns the backend and decoder, drains edges before control work, publishes state, and maintains its heartbeat.
 - The shared-state publisher provides coherent snapshots without allowing a reader-held lock to block acquisition.
 - The logger samples the latest state on monotonic deadlines; it never receives every GPIO event.
-- The public facade owns process lifecycle, startup handshake, reader-side stale-heartbeat detection, failure-policy signaling, and compatibility properties.
+- The public facade owns process lifecycle, startup handshake, reader-side stale-heartbeat detection, physical-state access, and failure-policy signaling.
 - The session wrapper maps session configuration/output paths to the facade; it does not buffer edge events.
 
 ## 5. Module and file layout
@@ -135,7 +136,8 @@ essential/
         shared_state.py                 # nonblocking coherent publication
         gpio_backend.py                 # EdgeSource Protocol, resolver, libgpiod adapter
         acquisition.py                  # worker loop, handshake, controls, heartbeat
-        continuous_logger.py            # monotonic 200 Hz sampler and incremental files
+        recording.py                    # SQLite schema, transactions, loading helpers
+        continuous_logger.py            # monotonic 200 Hz sampling process
         diagnostics.py                  # counters, histogram, ring buffer, summaries
 
 debug/
@@ -164,7 +166,8 @@ Do not create all files up front. Each module is added only when its work packag
 | `shared_state.py` | Publish/read coherent `state.py` fields through two nonblocking process-safe slots | Narrow publisher and reader objects used by acquisition, facade, and logger | No decoder, GPIO, health-policy, or file behavior |
 | `gpio_backend.py` | Resolve BCM pins, validate/request libgpiod lines, synchronize initial state, and adapt batches to `EdgeEvent` | Narrow `EdgeSource` Protocol, production `GpiodEdgeSource`, pure resolver helpers | Only module importing `gpiod`; no decoding, multiprocessing ownership, or disk writes |
 | `acquisition.py` | Run the worker around injected edge source, decoder state/functions, publisher, and bounded control/status endpoints | Top-level spawn-safe worker entry function and structured command/status dataclasses local to this boundary | Does not construct the behavior facade or logger and never performs disk I/O |
-| `continuous_logger.py` | Schedule fixed-rate snapshot reads and incrementally write the defined recording artifacts | Top-level spawn-safe logger entry function plus focused scheduler/writer helpers | No edge stream, quadrature decoding, or behavior callbacks |
+| `recording.py` | Own the versioned SQLite schema, bounded transactions, recovery/integrity helpers, enum/unit metadata, and explicit loading queries | Cohesive writer/loader functions or small resource class used by logger and offline consumers | No scheduling, processes, GPIO, quadrature, or behavior policy |
+| `continuous_logger.py` | Schedule fixed-rate snapshot reads and pass bounded batches/diagnostics to the injected recording writer | Top-level spawn-safe logger entry function plus deterministic deadline helpers | Does not define storage schema, decode edges, or invoke behavior callbacks |
 | `diagnostics.py` | Maintain bounded diagnostic aggregates/ring records and serialize diagnostic/summary structures | Focused dataclasses/functions consumed by decoder, worker, and logger | No process orchestration; does not become a general application logging framework |
 | `essential/treadmill_decoder.py` | Composition/public API boundary: validate supplied config, assemble concrete defaults, own lifecycle, and expose simple behavior-facing operations | `TreadmillDecoder`, public state/config/errors re-exported intentionally | The only place allowed to know the complete runtime composition; no quadrature or libgpiod implementation details |
 | `essential/Treadmill.py` | Translate existing session configuration/output basename to the public decoder facade | Backward-compatible session equipment interface where approved | No edge callbacks, event list, GPIO details, or duplicate health logic |
@@ -202,18 +205,19 @@ Do not create all files up front. Each module is added only when its work packag
 | `read_batch_size` | positive `int`, events | initial `256`; tune only from measurements |
 | `continuous_log_enabled` | `bool` | `True` |
 | `continuous_log_rate_hz` | positive `float`, Hz | `200.0` |
+| `continuous_log_commit_interval_s` | positive `float`, seconds | `1.0`; bounds normal uncommitted sample window |
 | `continuous_logger_required` | `bool` | recommended `False` |
-| `treadmill_required` | `bool` | required for behavior-dependent use; passive logging may set `False` |
+| `treadmill_required` | `bool` | `False` for current passive use; when `True`, requires successful startup but does not constrain runtime failure policy |
 | `raw_edge_logging_enabled` | `bool` | `False` |
 | `diagnostic_ring_buffer_size` | positive `int`, events | `8192` |
 | `heartbeat_interval_s` | positive `float`, seconds | choose from measured scheduler behavior |
 | `heartbeat_failure_timeout_s` | positive `float`, seconds | greater than heartbeat interval with explicit margin |
 | `processing_lag_warning_ns` | positive `int`, ns | derive from buffer/rate validation |
 | `startup_timeout_s` | positive `float`, seconds | explicit, bounded |
-| `failure_policy` | `WARN`, `PAUSE`, `ABORT` | spec recommendation `PAUSE`, pending pause-semantics decision |
+| `failure_policy` | `WARN`, `PAUSE`, `ABORT` | `WARN`; user-selectable independently of `treadmill_required` |
 | `expected_max_transition_rate_hz` | optional positive `float`, Hz | required before production acceptance |
 
-Validation will reject invalid values, pin conflicts, impossible heartbeat relationships, non-writable output destinations, and configurations whose buffer headroom is below a documented threshold once maximum event rate is known.
+Validation will reject invalid values, pin conflicts, impossible heartbeat relationships, non-writable output destinations, and configurations whose buffer headroom is below a documented threshold once maximum event rate is known. Every combination of `treadmill_required` and valid `failure_policy` is allowed. `treadmill_required` controls whether failure to establish an initial usable acquisition aborts startup; `failure_policy` controls the reported action after a started subsystem degrades or fails.
 
 ### 6.2 Generic edge event
 
@@ -241,6 +245,8 @@ Use a typed `TreadmillState` containing at least:
 - `state_version`/publication generation.
 
 `time_since_last_motion_s` and timeout-adjusted `speed_mm_s` are calculated from a caller-supplied/current monotonic timestamp when the snapshot is materialized. A dead acquisition heartbeat overrides effective reader-side health to `FAILED`; it must never appear as stationary/zero speed without failure status.
+
+Failure-policy evaluation returns a small immutable result containing effective health, integrity, configured policy, action (`NONE`, `WARN`, `PAUSE_REQUESTED`, or `ABORT_REQUESTED`), a stable reason code, and an actionable message. `PAUSE_REQUESTED` is latched after a qualifying failure and exposed as a read-only convenience flag until explicit acquisition restart/re-arm. Producing this result and logging a state transition are the end of treadmill ownership; changing presenter/task state is outside this implementation.
 
 ### 6.4 Diagnostics and summaries
 
@@ -419,7 +425,9 @@ Use bounded queues with nonblocking acquisition-side polling and nonblocking ack
 
 ### 10.4 Heartbeat and health
 
-The acquisition worker publishes a heartbeat independently of motion. `snapshot()` and `require_healthy()` compare its age with the configured timeout. A stale heartbeat or dead child process produces effective `FAILED` even if the last canonical shared state said `READY`.
+The acquisition worker publishes a heartbeat independently of motion. `snapshot()`, `health_report()`, and `require_healthy()` compare its age with the configured timeout. A stale heartbeat or dead child process produces effective `FAILED` even if the last canonical shared state said `READY`.
+
+`health_report()` is non-throwing and returns the effective health plus the configured policy action. `require_healthy()` is the strict opt-in assertion for future code that requires trustworthy live position: it raises a typed integrity/availability exception when effective health is `FAILED`, integrity is invalid, or the heartbeat/worker is unavailable. A logger-only `DEGRADED` state does not make `require_healthy()` raise unless `continuous_logger_required=True`. Neither method changes task state.
 
 Health transitions are explicit and tested:
 
@@ -436,33 +444,51 @@ Health transitions are explicit and tested:
 
 ## 11. Continuous and diagnostic logging
 
-Use the existing `treadmill_filename` as a basename:
+Use the existing `treadmill_filename` as a basename for one primary recording:
 
 ```text
-<basename>.csv                       fixed-rate numeric state
-<basename>_metadata.json             configuration/platform/timebase metadata
-<basename>_diagnostics.jsonl         event-driven diagnostic records
-<basename>_summary.json              final integrity/resource summary
-<basename>_raw_failure_<stamp>.csv   ring-buffer dump on integrity failure
-<basename>_raw_edges.csv             optional full raw-edge debug mode only
+<basename>.sqlite3                    transactional treadmill recording
 ```
 
-The 200 Hz CSV minimum columns will be:
+The SQLite database is owned by the logger process; no other process writes it. Use a versioned schema with these cohesive tables:
+
+- `schema_info`: schema version, treadmill software/analysis version, and creation version;
+- `metadata`: JSON-encoded scalar/structured values keyed by stable names, including configuration, platform, GPIO mapping, backend versions, and units;
+- `timebase_anchors`: paired monotonic-ns and realtime/UTC-ns values plus anchor reason (`start`, `periodic` if enabled, `end`);
+- `samples`: the fixed-rate state record;
+- `diagnostic_events`: event-driven startup, mapping, command, health, integrity, logger, and shutdown events with structured JSON context;
+- `raw_events`: created/populated only for explicit full-raw debug mode or a preserved failure-ring dump, with a `capture_reason`/dump identifier;
+- `summary`: final named summary values and JSON context.
+
+The `samples` columns are:
 
 ```text
-sample_monotonic_ns, position_mm, distance_travelled_mm,
-speed_mm_s, last_edge_speed_mm_s, last_edge_monotonic_ns,
-locomotion_direction, raw_transition_position,
-health_code, integrity_valid, state_version
+sample_monotonic_ns INTEGER,
+position_mm REAL,
+distance_travelled_mm REAL,
+speed_mm_s REAL,
+last_edge_speed_mm_s REAL,
+last_edge_monotonic_ns INTEGER,
+locomotion_direction INTEGER,
+raw_transition_position INTEGER,
+health_code INTEGER,
+integrity_valid INTEGER,
+state_version INTEGER
 ```
 
-Write a header immediately, buffer a bounded number of rows, flush chunks incrementally, and periodically flush the Python buffer. Decide whether periodic `fsync` is worth its I/O cost from measurements; always flush and `fsync` during normal finalization. Never hold the full session in RAM.
+Define primary keys/indexes only where they serve concrete reads or integrity checks; do not index every diagnostic field. Integer enum codes are documented in `metadata` and converted to typed enums by loading helpers.
+
+Open the database and create/validate its schema before reporting logger startup success. Use prepared `executemany` inserts inside bounded transactions, committing at least every `continuous_log_commit_interval_s` or on orderly shutdown. The initial one-second default bounds the normally uncommitted sample window to approximately 200 rows at 200 Hz. Never hold the full session in RAM.
+
+Start with SQLite WAL journaling and `synchronous=FULL` so each completed transaction is durable and an interrupted database recovers through SQLite's normal mechanisms. Record requested and effective pragmas in metadata. Measure commit latency, WAL growth/checkpoint cost, disk bandwidth, CPU, and effect on the rest of the Pi; relax durability or change journal mode only through an approved, recorded decision. On normal shutdown, commit, checkpoint, close, and run a lightweight integrity check appropriate for the measured shutdown budget.
 
 The logger uses `next_deadline_ns += period_ns`. Deadline advancement/missed-period calculation is a deterministic module-level function receiving `now_ns`, `next_deadline_ns`, and `period_ns`. The process boundary supplies the production clock/wait operations; unit tests pass deterministic clock values without hidden global state. When late, the logger records the actual sample time, increments late/missed counts based on crossed deadlines, advances directly to the next future deadline, and emits one real sample—never duplicate catch-up rows.
 
 The logger runs as a separate process and will request a modest lower scheduling priority using ordinary unprivileged OS facilities where supported. Whether that request succeeded is metadata, not a hidden assumption; priority setup failure must not prevent baseline operation.
 
-At start and end, metadata records paired monotonic and UTC/realtime timestamps. Add periodic timebase anchors only if alignment tests show start/end anchors are insufficient. JSONL diagnostics record startup, resolved mapping, health transitions, zero acknowledgements, gaps/inconsistencies, logger/acquisition errors, and shutdown. Raw ring-buffer dumping occurs outside the acquisition hot path using a bounded handoff or after failure processing has stopped.
+At start and end, `timebase_anchors` records paired monotonic and UTC/realtime timestamps. Add periodic anchors only if alignment tests show start/end anchors are insufficient. Diagnostic rows record startup, resolved mapping, health transitions, zero acknowledgements, gaps/inconsistencies, logger/acquisition errors, and shutdown. Raw ring-buffer transfer/dumping occurs outside the acquisition hot path using a bounded nonblocking handoff or after failure processing has stopped.
+
+If the logger/database fails, it may be unable to persist its own failure. Therefore logger status is separately published to the facade, which emits a structured warning/error through the existing application logger and effective health state. A best-effort fallback JSON failure artifact may be written by the parent only after acquisition has stopped; it is not part of the acquisition hot path and must never be presented as a complete treadmill recording.
 
 ## 12. Behavior-stack integration and migration
 
@@ -478,17 +504,17 @@ At start and end, metadata records paired monotonic and UTC/realtime timestamps.
 
 - Convert to a thin session facade around `TreadmillDecoder(config, output_basename=...)`.
 - Remove per-edge callbacks, the in-memory `treadmill_log`, `record_event()`, and end-only flush from production behavior.
-- Expose `snapshot()`, `zero()`, `require_healthy()`, lifecycle methods, and temporary documented properties needed by existing callers.
-- If legacy properties `counts`, `distance_mm`, `speed_mms`, or `direction` are retained, calculate them from the newest snapshot and issue clear migration documentation; do not imply x4 transitions equal old x1 counts.
+- Expose `snapshot()`, `zero()`, health/policy evaluation, `pause_requested`, `require_healthy()`, and lifecycle methods.
+- Do not expose speculative legacy `counts`, `distance_mm`, `speed_mms`, or ambiguous `direction` properties. Tasks consume physical state fields and do not depend on treadmill internals.
 
 ### 12.3 `essential/behavbox.py` and `main.py`
 
-- If treadmill is enabled/required, let initialization and startup errors abort startup rather than swallowing them.
+- If `treadmill_required=True`, let initialization/startup errors abort session startup rather than swallowing them. If treadmill acquisition is enabled but optional, publish/log an unavailable failure state and allow session startup according to configuration.
 - Start treadmill acquisition before `presenter.start_session()` and ensure it is stopped in all cleanup paths before file transfer.
-- Add a lightweight health-policy check to each main-loop iteration, independent of task code.
-- Implement the approved `warn`/`pause`/`abort` behavior without placing task thresholds in the acquisition layer.
+- Surface treadmill health and typed policy outcomes through `box.treadmill`, but do not make the current generic behavior loop freeze/resume task progression. Future treadmill-dependent tasks own polling/handling `pause_requested` or the abort outcome.
+- Ensure `WARN` transitions are rate-limited/deduplicated in the application log so failures are loud without flooding the behavior loop.
 - Make cleanup report treadmill failures while still attempting cleanup of cameras, stimuli, and other devices.
-- Ensure treadmill metadata/summary files are included in the existing session-directory transfer.
+- Ensure the SQLite recording, any active WAL artifacts during abnormal recovery, and any fallback failure artifact remain in the session directory and are included in the existing transfer workflow.
 
 ### 12.4 Migration verification
 
@@ -497,9 +523,12 @@ On confirmed unchanged hardware, compare old x1 and new x4 acquisition during co
 ## 13. Dependencies and environment
 
 - Add only the official `gpiod` Python binding compatible with libgpiod v2; remove runtime reliance on `RPi.GPIO` for treadmill acquisition. Other behavior components may continue using gpiozero/RPi.GPIO, provided pin ownership is non-conflicting.
-- Follow repository policy by using `uv` and `uv run` for all Python dependency and test commands. Because the repository currently has only `requirements_simple.txt`, decide whether to introduce `pyproject.toml`/`uv.lock` or document a system-package bridge before implementation. Do not mix ad hoc `pip` installs with the chosen environment.
+- Add `pyproject.toml` and `uv.lock` as the authoritative reproducible environment. Inventory every entry in `requirements_simple.txt` and every directly imported third-party package before migration; preserve necessary behavior dependencies, remove only proven stale entries in separately reviewed changes, and place Pi/camera/GPIO-only packages behind appropriate platform markers or optional groups when cross-platform locking requires it.
+- Define at least a development/test dependency group and a documented Raspberry Pi hardware installation path. The exact `gpiod` version is pinned only after verifying the binding on target Pi 4/Pi 5 environments. Tests that use the synthetic edge source must remain runnable without `/dev/gpiochip` access.
+- Use `uv sync`, `uv lock`, and `uv run` for dependency and Python commands. Do not mix ad hoc `pip` installs with the locked environment. Record the required uv version or minimum version if lockfile behavior depends on it.
+- After the migration is accepted, treat `requirements_simple.txt` as deprecated reference material or remove it in a separately approved cleanup; never maintain two competing sources of truth.
 - Verify the installed API from official docs and the actual installed package source on the Pi before writing the adapter. Pin a tested binding version after Pi 4/Pi 5 validation, not before.
-- Do not add pandas, HDF5, or another logging dependency for this subsystem. CSV/JSON and the standard library are sufficient initially.
+- Use the standard-library `sqlite3` module for treadmill persistence. Do not add pandas, HDF5, PyArrow, or another storage dependency for this subsystem. Downstream analysis may read SQLite using `sqlite3` or existing pandas support without changing the recording process.
 - Document OS packages, permissions/group membership for `/dev/gpiochip*`, and a capability-check command. Do not require root or real-time scheduling for the baseline.
 
 Primary API/platform references to re-check during implementation:
@@ -514,6 +543,8 @@ Primary API/platform references to re-check during implementation:
 Each phase follows RED -> GREEN -> REFACTOR. Tests for a phase are committed before its implementation in a separate commit. The RED evidence (command, expected failures, and reason) is recorded in the commit message or implementation notes. Existing unrelated worktree changes are never included.
 
 All local Python commands use the PyCharm-configured interpreter through `uv run`, after consulting the environment configuration. Hardware tests receive pytest markers such as `hardware`, `stress`, and `soak` so ordinary unit tests remain hardware-independent.
+
+`TM-0C` is a dependency-environment migration rather than treadmill runtime behavior, so it does not manufacture an artificial RED test. It records the pre-migration test baseline, validates `uv lock`/`uv sync`, and reruns the same tests through `uv run`. All Phase 1+ runtime behavior still follows separate tests-only RED and implementation GREEN commits.
 
 ### 14.0 Terra Medium subagent execution protocol
 
@@ -596,22 +627,24 @@ The same Terra Medium subagent may receive assignment B after assignment A is re
 
 1. A fake monotonic clock produces nominal 200 Hz deadlines with monotonic actual timestamps.
 2. Late cycles count missed deadlines and write one actual sample without catch-up duplicates.
-3. CSV columns, units, enum encodings, JSON metadata, timebase anchors, JSONL diagnostic schema, and final summary are stable.
-4. Writes occur in bounded chunks; memory remains bounded; normal close flushes all acknowledged samples.
-5. A partially written/abnormally stopped file remains loadable through its last complete row.
+3. SQLite schema version, table/column types, units, enum encodings, JSON metadata/context, timebase anchors, diagnostic rows, raw-event rows, and final summary are stable.
+4. Writes occur in bounded transactions; memory remains bounded; normal close commits all acknowledged samples and checkpoints/closes cleanly.
+5. An interrupted/uncommitted transaction rolls back while prior committed batches remain queryable and pass SQLite integrity checks.
 6. Logger disk exceptions update logger status without blocking acquisition; required versus optional logger health outcomes differ as configured.
 7. Ring-buffer failure dumps and optional raw-edge mode contain reconstructable before/after state and sequence data.
-8. Repeated close is harmless and never overwrites a completed prior session file.
+8. Logger failure is visible through effective health and the application logger even when the database cannot accept a diagnostic row.
+9. Repeated close is harmless and never overwrites a completed prior session database.
 
 ### 14.5 Tests written first for Phase 5: repository integration
 
 1. `session_info` validates every treadmill field and detects conflicts with all enabled box GPIO assignments.
-2. Output configuration creates the expected treadmill basename/sidecar paths without writing outside the session directory.
+2. Output configuration creates the expected SQLite/fallback paths without writing outside the session directory.
 3. `Treadmill` delegates lifecycle/snapshot/zero/health without buffering edges.
 4. Required treadmill initialization/start failure prevents behavior session startup.
-5. Main-loop health checks map `warn`, approved `pause`, and `abort` outcomes correctly.
-6. Every normal and exceptional cleanup path closes treadmill before session file transfer and preserves diagnostics.
-7. Compatibility properties, if approved, have explicitly tested x1/x4 semantics and units.
+5. Optional treadmill initialization/start failure publishes/logs unavailability without preventing session startup.
+6. `WARN` is accepted for passive and treadmill-required configurations and permits continued task progression with explicit degraded/failed health; `PAUSE` latches a task-facing request and `ABORT` produces its distinct typed outcome without mutating presenter/task state.
+7. Every normal and exceptional cleanup path closes treadmill before session file transfer and preserves diagnostics.
+8. Public state exposes physical position/distance/speed contracts and does not expose speculative legacy raw-count aliases.
 
 ### 14.6 Tests written first for Phase 6: volume and stress
 
@@ -625,13 +658,12 @@ The same Terra Medium subagent may receive assignment B after assignment A is re
 
 ### Phase 0 — resolve requirements and establish environment
 
-- Answer the open questions in Section 18.
-- Choose non-conflicting pins and inspect actual encoder electrical characteristics.
-- Record target Pi 4/Pi 5 OS, Python, kernel, and libgpiod versions.
-- Decide uv project layout and verify the official binding on target hardware.
+- Planning entry gate before any mutating work: answer Section 18.1 questions 1–3, preserve decisions 4–8 unless explicitly revised, and obtain user approval of this plan.
+- Record the chosen non-conflicting pins, actual encoder electrical characteristics, target Pi/OS/Python/kernel/libgpiod versions, and session-duration requirement.
+- Inventory current imports/requirements, add the approved `pyproject.toml`/`uv.lock` environment, and verify the official binding on target hardware.
 - Create a centralized GPIO allocation inventory.
 
-Exit gate: decisions are documented and the implementation plan is approved. No code is written before this gate.
+Exit gate: approved decisions/hardware facts are recorded; `pyproject.toml`/`uv.lock` are the verified source of truth on supported development/Pi paths; the existing test baseline is recorded; and the GPIO allocation inventory is approved. No Phase 1 tests or runtime implementation begin before this gate.
 
 ### Phase 1 — pure decoder
 
@@ -661,10 +693,10 @@ Exit gate: coherence and stalled-reader tests pass; acquisition death is detecte
 ### Phase 4 — fixed-rate logging and diagnostics
 
 - Commit Section 14.4 tests and confirm RED.
-- Implement logger process, incremental CSV/JSON artifacts, diagnostic event stream, timebase anchors, failure dumps, and summary.
+- Implement the logger process, versioned SQLite schema, bounded transactions, diagnostic/timebase/raw/summary tables, recovery checks, and application-log fallback.
 - Measure 200 Hz CPU and MB/hour on target Pi/storage.
 
-Exit gate: timing/file/failure tests pass, memory stays bounded, abnormal output is recoverable to its last complete record, and logging never blocks acquisition.
+Exit gate: timing/schema/transaction/failure tests pass, memory stays bounded, abnormal output recovers to its last committed transaction, SQLite integrity checks pass, and logging never blocks acquisition.
 
 ### Phase 5 — behavior-stack migration
 
@@ -672,7 +704,7 @@ Exit gate: timing/file/failure tests pass, memory stays bounded, abnormal output
 - Update session config, `Treadmill` facade, `BehavBox`, `main.py`, cleanup, and documentation.
 - Run the complete existing test suite and a debug session with a synthetic backend.
 
-Exit gate: required failures stop session startup/run, clean shutdown precedes transfer, existing non-treadmill sessions behave unchanged, and no task consumes ambiguous raw counts.
+Exit gate: required startup failures stop session startup, runtime WARN/PAUSE/ABORT outcomes remain distinct and visible without treadmill-owned task-state mutation, clean shutdown precedes transfer, existing non-treadmill sessions behave unchanged, and no task consumes ambiguous raw counts.
 
 ### Phase 6 — synthetic acceptance and stress characterization
 
@@ -700,9 +732,10 @@ These are the default units of delegation. The coordinating agent may split a pa
 
 | Package | Depends on | Terra Medium scope and primary files | Required output/evidence |
 |---|---|---|---|
-| `TM-0A` Decisions and environment inventory | Plan approval | Read-only inspection plus Section 18 answers; target Pi/OS/Python/libgpiod, encoder electronics, pins, session length, deployment source | Updated Sections 3, 13, 18, and 19; no implementation |
+| `TM-0A` Remaining decisions and environment inventory | Plan approval | Read-only inspection plus remaining Section 18 answers 1–3; target Pi/OS/Python/libgpiod, encoder electronics, pins, and session length | Updated Sections 3, 13, 18, and 19; no runtime implementation |
 | `TM-0B` GPIO ownership inventory | `TM-0A` | Locate all GPIO allocations; plan centralized validation in `session_info.py`/new config without editing runtime code in the planning assignment | Approved pin map and conflict rules recorded in plan |
-| `TM-1A` Config/public-state RED | `TM-0A`, `TM-0B` | Tests only for `config.py` and `state.py`; validation, enums, units, immutable public contracts and explicit-width conversion rules | Tests-only commit; focused `uv run pytest` output showing expected missing-implementation failures |
+| `TM-0C` uv environment migration | `TM-0A` | Inventory imports and `requirements_simple.txt`; add `pyproject.toml`/`uv.lock`, platform/optional groups, and migration notes without treadmill runtime code | `uv lock`/`uv sync` evidence on supported development and Pi paths; existing test-suite baseline; authoritative-source transition recorded |
+| `TM-1A` Config/public-state RED | `TM-0B`, `TM-0C` | Tests only for `config.py` and `state.py`; validation, enums, units, immutable public contracts and explicit-width conversion rules | Tests-only commit; focused `uv run pytest` output showing expected missing-implementation failures |
 | `TM-1B` Config/public-state GREEN | `TM-1A` | Implement only `config.py`, `state.py`, and their data contracts | Focused GREEN plus affected regression tests; implementation commit |
 | `TM-1C` Nominal quadrature RED/GREEN | `TM-1B` | Tests first, then `quadrature.py` edge/internal-state dataclasses and nominal x4 functions for calibration/sign, position/distance, speed, and zero offsets | Separate RED and GREEN commits; exhaustive starting-state evidence |
 | `TM-1D` Integrity/diagnostics RED/GREEN | `TM-1C` | Failure-matrix tests, then sequence/state/timestamp checks, latching, lag aggregates, bounded ring | Separate commits; randomized/failure/bounded-memory evidence |
@@ -712,12 +745,12 @@ These are the default units of delegation. The coordinating agent may split a pa
 | `TM-3A` Shared publication | `TM-1D` | Coherence/stalled-reader tests first, then `shared_state.py` double-slot publication | Stress evidence: no torn states and writer progress with stalled readers |
 | `TM-3B` Acquisition lifecycle | `TM-2C`, `TM-3A` | Process/startup/heartbeat/death/shutdown tests first, then `acquisition.py` | Bounded lifecycle timings, staged errors, child cleanup evidence |
 | `TM-3C` Controls, health, facade | `TM-3B` | Zero/queue/policy tests first, then `essential/treadmill_decoder.py` facade and typed outcomes | Ack/version evidence; effective-health and compatibility review |
-| `TM-4A` Logger schemas and incremental writer | `TM-3A`, decisions in `TM-0A` | File-contract/partial-file tests first, then CSV/JSON/JSONL writer primitives | Stable schema fixtures, bounded-buffer and abnormal-file evidence |
-| `TM-4B` Logger process and scheduler | `TM-3B`, `TM-4A` | Deadline/lateness/failure tests first, then `continuous_logger.py` process | 200 Hz simulated timing evidence; no catch-up duplicates/backpressure |
-| `TM-4C` Diagnostic artifacts and summary | `TM-1D`, `TM-4B` | Event/failure-dump/summary tests first, then diagnostics integration | Reconstructable ring dump and complete summary fixture |
+| `TM-4A` SQLite schema and incremental writer | `TM-3A`, `TM-0C` | Schema/transaction/recovery tests first, then `recording.py` writer/loading primitives | Stable versioned schema fixtures, bounded-transaction and rollback/recovery evidence |
+| `TM-4B` Logger process and scheduler | `TM-3B`, `TM-4A` | Deadline/lateness/failure-status tests first, then `continuous_logger.py` process | 200 Hz simulated timing evidence; no catch-up duplicates/backpressure; logger status survives database failure |
+| `TM-4C` Diagnostic artifacts and summary | `TM-1D`, `TM-3C`, `TM-4B` | Event/failure-dump/summary and application-log fallback tests first, then diagnostics/facade integration | Reconstructable ring dump, complete summary fixture, and logger-failure evidence outside the failed database |
 | `TM-5A` Session configuration integration | `TM-3C`, `TM-4C` | `session_info.py` tests first, then expanded config and centralized GPIO collision checks | Existing config regression plus conflict/error evidence |
-| `TM-5B` Session facade migration | `TM-3C`, `TM-4C`, `TM-5A` | `essential/Treadmill.py` delegation/compatibility tests first, then removal of edge buffering | Proof no unbounded edge list/callback path remains |
-| `TM-5C` Behavior lifecycle and failure policy | `TM-5B`, approved pause semantics | `essential/behavbox.py` and `main.py` startup/loop/cleanup tests first, then integration | Required failures stop safely; cleanup order and file-transfer evidence |
+| `TM-5B` Session facade migration | `TM-3C`, `TM-4C`, `TM-5A` | `essential/Treadmill.py` physical-state/delegation tests first, then removal of edge buffering and ambiguous legacy fields | Proof no unbounded edge list/callback path or speculative raw-count API remains |
+| `TM-5C` Equipment lifecycle and policy exposure | `TM-5B` | `essential/behavbox.py` and `main.py` startup/cleanup plus policy-outcome tests first, then integration | WARN continuation for optional and required runtime use, distinct pause/abort outcomes, no task-state mutation, startup-required behavior, cleanup order and transfer evidence |
 | `TM-5D` Operator/developer documentation | `TM-5C` | `docs/treadmill_setup.md` and `docs/treadmill_validation.md`; no runtime edits | Setup, calibration, health, recovery, tests, migration reviewed for fresh-user usability |
 | `TM-6A` High-volume synthetic validation | `TM-1D`, `TM-3C` | Seeded millions-event utility/tests and resource measurement | Exact totals, seed/config/version, throughput and bounded-memory report |
 | `TM-6B` Full process stress validation | `TM-4C`, `TM-5C`, `TM-6A` | Synthetic source through real processes/logger under representative loads | Exact totals, zero gaps, resource/storage/lag report and saved artifacts |
@@ -763,18 +796,23 @@ Production approval requires a saved validation record showing:
 - [ ] long full-stack soak passes with no loss, drift, failure, unbounded growth, or backlog;
 - [ ] setup/calibration/operation/failure/migration documentation reviewed by another lab member.
 
-## 18. Questions requiring user/lab decisions before implementation
+## 18. Resolved decisions and remaining user/lab questions
+
+### 18.1 Still required before implementation
 
 1. Which two BCM pins should replace conflicting BCM17/27 on each rig, and are any other devices connected but not represented in `BehavBox`?
 2. What are the encoder model, output voltage/output type, external pull resistors, roller circumference, and approximate maximum treadmill speed?
 3. Which Raspberry Pi models and Raspberry Pi OS releases are mandatory, and what is the longest expected session duration?
-4. Should a logger failure abort/pause the task (`continuous_logger_required=True`) or only degrade/warn as recommended here?
-5. What must “pause” do operationally: freeze presenter/task progression until an operator explicitly restarts acquisition, end the current trial, or end the session safely?
-6. Are any current or planned task modules consuming `treadmill.counts`, `distance_mm`, `speed_mms`, or `direction` outside the repository? This determines whether temporary compatibility aliases are necessary.
-7. Is CSV interoperability required, or may the implementation switch to a compact binary record if measured 200 Hz CSV cost is too high?
-8. May the repository adopt `pyproject.toml` and `uv.lock`, or must it retain `requirements_simple.txt` as the deployment source of truth?
 
-Until these questions are answered, Phase 0 can gather environment/hardware facts, but implementation should not make assumptions that alter wiring, failure behavior, external API compatibility, or deployment.
+Until questions 1–3 are answered, Phase 0 may perform read-only inventory/planning, but it must not assume wiring, electrical safety, calibration, event-rate targets, supported platforms, or soak duration.
+
+### 18.2 Resolved on 2026-08-28
+
+4. Logger failure behavior: degrade effective health, emit a warning, and log structured failure information. The logger is not required by default and logger-only failure does not invalidate edge integrity.
+5. Runtime policy: `WARN` is the default and remains valid even when a task requires/uses treadmill data. End users choose their tolerance for imperfect data. When explicitly configured, `PAUSE` emits/latches a pause-request outcome whose intended meaning is “freeze task progression”; implementing that transition belongs to future task code. `PAUSE` and `ABORT` are never required policies.
+6. Compatibility: no current/planned task module consumes legacy treadmill handling/count fields. New tasks are expected to consume exposed physical speed and position/distance. Do not add legacy aliases speculatively.
+7. Storage interoperability: CSV compatibility is not required. Use the versioned transactional SQLite design in Section 11.
+8. Environment: adopt `pyproject.toml` and `uv.lock` as the authoritative dependency definition, following the migration requirements in Section 13.
 
 ## 19. Living implementation ledger and handoff protocol
 
@@ -831,12 +869,12 @@ Do not write “tests pass” without the command and summarized result. Do not 
 
 | Phase | Status | Evidence/commit | Next gate |
 |---|---|---|---|
-| Phase 0 — decisions/environment | `IN PROGRESS` (planning only) | This plan; no implementation commit | User answers Section 18 and approves plan |
+| Phase 0 — decisions/environment | `IN PROGRESS` (planning only) | Decisions 4–8 recorded; no implementation commit | User answers Section 18.1 questions 1–3 and approves plan |
 | Phase 1 — pure decoder | `NOT STARTED` | None | `TM-1A` tests-only RED assignment |
 | Phase 2 — GPIO backend | `NOT STARTED` | None | Phase 1 complete and target binding verified |
 | Phase 3 — multiprocessing/shared state | `NOT STARTED` | None | Required Phase 2 and `TM-3A` prerequisites complete |
 | Phase 4 — logger/diagnostics | `NOT STARTED` | None | Shared-state contracts stable |
-| Phase 5 — behavior integration | `NOT STARTED` | None | Facade/logger stable and pause semantics approved |
+| Phase 5 — behavior integration | `NOT STARTED` | None | Facade/logger stable and physical API/policy boundary implemented |
 | Phase 6 — synthetic stress | `NOT STARTED` | None | Integrated non-hardware system complete |
 | Phase 7 — hardware acceptance | `NOT STARTED` | None | Hardware facts available and Phase 6 accepted |
 
@@ -849,6 +887,7 @@ Current planning handoff:
 - Status: planning in progress; implementation not started.
 - Current artifact: `docs/treadmill_plan.md`.
 - Latest design review: `docs/SoftwareDesign.md` was read on 2026-08-28. The proposed catch-all `models.py` and separate `gpio_resolution.py` were removed from the layout; data now stays with cohesive functions, the functional-core/composition/Protocol rules are explicit, and lower layers receive narrow dependencies rather than `session_info`.
-- Known blocking facts: BCM17/27 conflict with existing behavior-box allocations; hardware/electrical/calibration/platform details and pause semantics are unresolved.
+- Latest user decisions: logger failures degrade/warn/log; `WARN` is allowed for passive and treadmill-dependent tasks; policy rigidity is always user-selectable; explicit `PAUSE` only publishes a task-facing request; no legacy count API is needed; SQLite replaces CSV; `pyproject.toml`/`uv.lock` will be authoritative.
+- Known blocking facts: BCM17/27 conflict with existing behavior-box allocations; hardware/electrical/calibration/platform details in Section 18.1 remain unresolved.
 - Repository caution: the worktree contained unrelated user changes before/during planning; future agents must inspect and preserve them.
-- Exact next action: user reviews this plan and answers Section 18. The plan is revised/approved in a planning-only chat before any `TM-1*` test or implementation assignment.
+- Exact next action: user supplies Section 18.1 answers 1–3 when available, then reviews/approves the complete plan before any `TM-0C` or `TM-1*` dependency/test/implementation assignment.
